@@ -13,9 +13,18 @@ import * as fs from "fs";
 import * as path from "path";
 
 interface NodeGraphSettings {
+	rootPath: string;
 	tsvFolderPath: string;
 	dataJsonFolderPath: string;
 	canvasJsonFolderPath: string;
+}
+enum SyncStatus {
+	Tracked = 0,
+	Modified = 1
+}
+interface SyncJson {
+	datajson: { [key: string]: SyncStatus };
+	canvasjson: { [key: string]: SyncStatus };
 }
 
 interface DataNode {
@@ -94,6 +103,7 @@ interface SubgraphSize {
 }
 
 const DEFAULT_SETTINGS: NodeGraphSettings = {
+	rootPath: "static/_data/OKR",
 	tsvFolderPath: "tsv",
 	dataJsonFolderPath: "data_json",
 	canvasJsonFolderPath: "canvas_json",
@@ -169,6 +179,7 @@ function countCharacters(text: string): {
 export default class NodeGraphPlugin extends Plugin {
 	settings: NodeGraphSettings;
 	Graph: Graph = new Graph();
+	syncFilePath: string = "";
 	async onload() {
 		await this.loadSettings();
 
@@ -177,20 +188,22 @@ export default class NodeGraphPlugin extends Plugin {
 			"network",
 			"Node Graph",
 			(_evt: MouseEvent) => {
-				this.processFiles(true); // 传递true强制重新生成JSON文件
+				this.processFiles(); // 传递true强制重新生成JSON文件
 			}
 		);
 		ribbonIconEl.addClass("node-graph-ribbon-class");
 
 		// 添加设置选项卡
 		this.addSettingTab(new NodeGraphSettingTab(this.app, this));
-
+		this.syncFilePath = `${this.settings.rootPath}/syncFile.json`
 		// 插件加载时处理文件
 		this.processFiles();
+		this.app.vault.on('modify', this.handleFileModify.bind(this));
 	}
 
 	onunload() {
 		// 清理工作
+		this.app.vault.off('modify', this.handleFileModify.bind(this));
 	}
 
 	async loadSettings() {
@@ -201,32 +214,35 @@ export default class NodeGraphPlugin extends Plugin {
 		);
 	}
 
+
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
 
 	// 主处理函数
-	async processFiles(forceRegenerate = false) {
+	async processFiles() {
+		const vault = this.app.vault;
+
+		// 确保文件夹存在
+		await this.ensureFoldersExist();
+
 		try {
-			const vault = this.app.vault;
-
-			// 确保文件夹存在
-			await this.ensureFoldersExist();
-
+			
 			// 获取所有TSV文件
 			const tsvFiles = await this.getFilesInFolder(
-				this.settings.tsvFolderPath,
+				`${this.settings.rootPath}/${this.settings.tsvFolderPath}`,
 				".tsv"
 			);
+			
 
 			for (const tsvFile of tsvFiles) {
 				const fileName = path.basename(tsvFile, ".tsv");
-				const dataJsonPath = `${this.settings.dataJsonFolderPath}/${fileName}.json`;
-				const canvasJsonPath = `${this.settings.canvasJsonFolderPath}/${fileName}.canvas`;
+				const dataJsonPath = `${this.settings.rootPath}/${this.settings.dataJsonFolderPath}/${fileName}.json`;
+				const canvasJsonPath = `${this.settings.rootPath}/${this.settings.canvasJsonFolderPath}/${fileName}.canvas`;
 
 				// 检查是否需要从TSV转换（文件不存在或强制重新生成）
 				const dataJsonExists = await this.fileExists(dataJsonPath);
-				if (!dataJsonExists || forceRegenerate) {
+				if (!dataJsonExists) {
 					// 从TSV转换到Data JSON
 					const tsvContent = await this.readFile(tsvFile);
 					const dataJson =
@@ -248,22 +264,190 @@ export default class NodeGraphPlugin extends Plugin {
 						this.Graph.convertDataJsonToCanvasJson(dataJson);
 					await this.writeJsonFile(canvasJsonPath, canvasJson);
 					new Notice(`已将 ${fileName}.json 转换为 Canvas JSON`);
-				} else {
-					// 同步Data JSON和Canvas JSON
-					await this.syncJsonFiles(dataJsonPath, canvasJsonPath);
+					await this.writeSyncStatus(
+						this.syncFilePath,
+						fileName,
+						SyncStatus.Tracked,
+						SyncStatus.Tracked,
+					);
 				}
 			}
 
-			new Notice("Node Graph 处理完成");
+			new Notice("TSV文件处理完成");
+
 		} catch (error) {
-			console.error("处理文件时出错:", error);
+			console.error("处理TSV文件时出错:", error);
 			// 确保显示详细的错误信息，包括行号和具体问题
 			const errorMessage =
 				error instanceof Error ? error.message : "未知错误";
-			new Notice(`Node Graph 处理失败: ${errorMessage}`);
+			new Notice(`TSV文件处理失败: ${errorMessage}`);
+		}
+		try{
+			if(!await this.fileExists(this.syncFilePath))
+				return;
+			let syncJson = await this.readJsonFile<SyncJson>(
+						this.syncFilePath
+			);
+			// 使用Object.entries遍历对象字面量
+			for (const [fileName, status] of Object.entries(syncJson.datajson)) {
+				if (status === SyncStatus.Modified) {
+					const dataJsonPath = `${this.settings.rootPath}/${this.settings.dataJsonFolderPath}/${fileName}.json`;
+					const canvasJsonPath = `${this.settings.rootPath}/${this.settings.canvasJsonFolderPath}/${fileName}.canvas`;
+					let dataJson = await this.readJsonFile<DataJson>(dataJsonPath);
+					let canvasJson = await this.readJsonFile<CanvasJson>(canvasJsonPath);
+					dataJson.nodes.forEach((node) => {
+						const canvasNode = canvasJson.nodes.find(
+							(n) => n.id === node.id
+						);
+						if (canvasNode) {
+							if(node.status!==0)
+								canvasNode.color = STATUS_TO_COLOR[node.status];
+							else
+								canvasNode.color = LEVEL_TO_COLOR[node.level];
+						}
+					});
+					await this.writeJsonFile(canvasJsonPath, canvasJson);
+				}
+				await this.writeSyncStatus(
+						this.syncFilePath,
+					fileName,
+					SyncStatus.Tracked,
+					SyncStatus.Tracked,
+				);
+			}
+			// 使用Object.entries遍历canvasjson对象字面量
+			for (const [fileName, status] of Object.entries(syncJson.canvasjson)) {
+				if (status === SyncStatus.Modified) {
+					const dataJsonPath = `${this.settings.rootPath}/${this.settings.dataJsonFolderPath}/${fileName}.json`;
+					const canvasJsonPath = `${this.settings.rootPath}/${this.settings.canvasJsonFolderPath}/${fileName}.canvas`;
+					let dataJson = await this.readJsonFile<DataJson>(dataJsonPath);
+					let canvasJson = await this.readJsonFile<CanvasJson>(canvasJsonPath);
+					canvasJson.nodes.forEach((node) => {
+						const dataNode = dataJson.nodes.find(
+							(n) => n.id === node.id
+						);
+						if (dataNode) {
+							let color = node.color;
+							for(let status in STATUS_TO_COLOR){
+								if(STATUS_TO_COLOR[status]===color){
+									dataNode.status = parseInt(status);
+									break;
+								}
+							}
+							
+							
+							for(let level in LEVEL_TO_COLOR){
+								if(LEVEL_TO_COLOR[level]===node.color){
+									dataNode.level = parseInt(level);
+									break;
+								}
+							}
+							dataNode.content = node.text;
+						}else{
+							let color = node.color;
+							let Nodestatus = 0;
+							let Nodelevel = 0;
+							for(let status in STATUS_TO_COLOR){
+								if(STATUS_TO_COLOR[status]===color){
+									Nodestatus = parseInt(status);
+									break;
+								}
+							}
+							for(let level in LEVEL_TO_COLOR){
+								if(LEVEL_TO_COLOR[level]===node.color){
+									Nodelevel = parseInt(level);
+									break;
+								}
+							}
+							
+							let dataNode :DataNode = {
+								id: node.id,
+								level: Nodelevel,
+								content: node.text,
+								estimated_time: '',
+								status: Nodestatus
+							};
+							dataJson.nodes.push(dataNode);
+						}
+					});
+					canvasJson.edges.forEach((edge) => {
+						const dataEdge = dataJson.edges.find(
+							(e) => e.from === edge.fromNode && e.to === edge.toNode
+						);
+						if (!dataEdge) {
+							dataJson.edges.push({
+								
+								from: edge.fromNode,
+								to: edge.toNode,
+								
+							});
+						}
+					});
+					await this.writeJsonFile(dataJsonPath, dataJson);
+				}
+				await this.writeSyncStatus(
+						this.syncFilePath,
+					fileName,
+					SyncStatus.Tracked,
+					SyncStatus.Tracked,
+				);
+			};
+
+
+		}catch (error) {
+			console.error("同步文件时出错:", error);
+			// 确保显示详细的错误信息，包括行号和具体问题
+			const errorMessage =
+				error instanceof Error ? error.message : "未知错误";
+			new Notice(`同步文件失败: ${errorMessage}`);
 		}
 	}
+	async writeSyncStatus(
+		syncFilePath: string,
+		fileName: string,
+		datajsonStatus: SyncStatus,
+		canvasjsonStatus: SyncStatus,
+	) {
+		const syncFileExists = await this.fileExists(syncFilePath);
+		let syncJson: SyncJson;
+		if (!syncFileExists) {
+			syncJson = {
+				datajson: {},
+				canvasjson: {},
+			};
 
+		}else{
+			syncJson = await this.readJsonFile<SyncJson>(
+				syncFilePath
+			);}
+		new Notice(`文件 ${fileName} 已writeSyncStatus`);
+		// 使用对象字面量而不是Map
+		syncJson.datajson[fileName] = datajsonStatus;
+		syncJson.canvasjson[fileName] = canvasjsonStatus;
+		await this.writeJsonFile(syncFilePath, syncJson);
+	}
+
+	async handleFileModify(file: TFile) {
+		// new Notice(`文件 ${file.path} 已修改`);
+		new Notice(`${this.settings.rootPath}/${this.settings.dataJsonFolderPath}`);
+		if(file.path.startsWith(`${this.settings.rootPath}/${this.settings.dataJsonFolderPath}`)){
+			let fileName = file.basename.split(".")[0];
+			await this.writeSyncStatus(
+					this.syncFilePath,
+				fileName,
+				SyncStatus.Modified,
+				SyncStatus.Tracked,
+			);
+		}else if(file.path.startsWith(`${this.settings.rootPath}/${this.settings.canvasJsonFolderPath}`)){
+			let fileName = file.basename.split(".")[0];
+			await this.writeSyncStatus(
+					this.syncFilePath,
+				fileName,
+				SyncStatus.Tracked,
+				SyncStatus.Modified,
+			);
+		}
+	}
 	// 确保文件夹存在
 	async ensureFoldersExist() {
 		const vault = this.app.vault;
@@ -359,99 +543,6 @@ export default class NodeGraphPlugin extends Plugin {
 			await vault.create(normalizedPath, content);
 		}
 	}
-
-	// 同步Data JSON和Canvas JSON
-	async syncJsonFiles(dataJsonPath: string, canvasJsonPath: string) {
-		// 读取两个JSON文件
-		const dataJson = await this.readJsonFile<DataJson>(dataJsonPath);
-		const canvasJson = await this.readJsonFile<CanvasJson>(canvasJsonPath);
-
-		// 创建节点映射
-		const dataNodeMap = new Map<string, DataNode>();
-		dataJson.nodes.forEach((node) => dataNodeMap.set(node.id, node));
-
-		const canvasNodeMap = new Map<string, CanvasNode>();
-		canvasJson.nodes.forEach((node) => canvasNodeMap.set(node.id, node));
-
-		// 检查是否需要更新Canvas JSON
-		let needsUpdate = false;
-
-		// 更新节点
-		canvasJson.nodes.forEach((canvasNode) => {
-			const dataNode = dataNodeMap.get(canvasNode.id);
-			if (dataNode) {
-				// 更新文本内容
-				if (canvasNode.text !== dataNode.content) {
-					canvasNode.text = dataNode.content;
-					needsUpdate = true;
-				}
-
-				// 更新颜色（基于状态）
-				const newColor = STATUS_TO_COLOR[dataNode.status] || "0";
-				if (canvasNode.color !== newColor) {
-					canvasNode.color = newColor;
-					needsUpdate = true;
-				}
-			}
-		});
-
-		// 检查是否有新节点需要添加
-		dataJson.nodes.forEach((dataNode) => {
-			if (!canvasNodeMap.has(dataNode.id)) {
-				// 添加新节点
-				const newCanvasNode: CanvasNode = {
-					id: dataNode.id,
-					type: "text",
-					text: dataNode.content,
-					styleAttributes:
-						dataNode.level === 0 || dataNode.level === 1
-							? { textAlign: "center" }
-							: {},
-					x: -1500, // 默认位置，可以后续优化
-					y: 220,
-					width: Math.max(
-						120,
-						Math.min(dataNode.content.length * 8, 400)
-					),
-					height: 60,
-					color: STATUS_TO_COLOR[dataNode.status] || "0",
-				};
-				canvasJson.nodes.push(newCanvasNode);
-				needsUpdate = true;
-			}
-		});
-
-		// 检查是否有新边需要添加
-		const existingEdgeIds = new Set(
-			canvasJson.edges.map((edge) => `${edge.fromNode}_${edge.toNode}`)
-		);
-		dataJson.edges.forEach((edge) => {
-			// 验证边的有效性：to节点必须存在于数据节点映射中
-			if (dataNodeMap.has(edge.to)) {
-				const edgeId = `${edge.from}_${edge.to}`;
-				if (!existingEdgeIds.has(edgeId)) {
-					// 添加新边
-					canvasJson.edges.push({
-						id: edgeId,
-						styleAttributes: {},
-						toFloating: false,
-						fromFloating: false,
-						fromNode: edge.from,
-						fromSide: "right",
-						toNode: edge.to,
-						toSide: "left",
-					});
-					needsUpdate = true;
-				}
-			}
-		});
-
-		// 如果需要更新，写入Canvas JSON
-		if (needsUpdate) {
-			await this.writeJsonFile(canvasJsonPath, canvasJson);
-			new Notice(`已同步 ${path.basename(canvasJsonPath)}`);
-		}
-	}
 }
 
 class NodeGraphSettingTab extends PluginSettingTab {
@@ -468,6 +559,18 @@ class NodeGraphSettingTab extends PluginSettingTab {
 		containerEl.empty();
 		containerEl.createEl("h2", { text: "Node Graph 设置" });
 
+		new Setting(containerEl)
+			.setName("根文件夹路径")
+			.setDesc("存放数据的文件夹路径")
+			.addText((text) =>
+				text
+					.setPlaceholder("static/_data/OKR")
+					.setValue(this.plugin.settings.rootPath)
+					.onChange(async (value) => {
+						this.plugin.settings.rootPath = value;
+						await this.plugin.saveSettings();
+					})
+			);
 		// TSV文件夹路径设置
 		new Setting(containerEl)
 			.setName("TSV文件夹路径")
