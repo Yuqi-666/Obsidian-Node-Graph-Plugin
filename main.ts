@@ -112,6 +112,7 @@ const LEVEL_TO_COLOR: { [key: number]: string } = {
 	4: "rgba(0, 0, 255, 1)", //子任务
 };
 
+
 // 字符宽度常量 (每字符像素)
 const BODY_CHINESE_CHAR_WIDTH = 16;
 const BODY_ALPHANUM_CHAR_WIDTH = 8;
@@ -622,7 +623,6 @@ class Graph {
 		// 预计算并缓存所有节点的宽高，便于后续布局与渲染使用
 		this.calculateAllNodeSizes();
 
-
 		//遍历rootNodes，将它们添加到canvasNodes中
 		const rootNodes: LinkedListNode[] = [];
 		this.graph.nodes.forEach((node, id) => {
@@ -715,7 +715,6 @@ class Graph {
 											toSide: "right",
 										});
 									}
-
 								} else
 									canvasEdges.push({
 										id: `${predecessor}_${chain.chain[i].data.id}`,
@@ -1004,7 +1003,6 @@ class Graph {
 																			.content,
 																styleAttributes:
 																{
-
 																},
 																x: SubTask_X,
 																y: SubTask_Y,
@@ -1197,7 +1195,6 @@ class Graph {
 									nodelist[i].size[0] / 2
 								);
 							}
-
 						}
 					}
 				}
