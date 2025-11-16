@@ -13,11 +13,26 @@ import * as fs from "fs";
 import * as path from "path";
 
 interface NodeGraphSettings {
+	rootPath: string;
 	tsvFolderPath: string;
 	dataJsonFolderPath: string;
 	canvasJsonFolderPath: string;
 }
+enum SyncStatus {
+	Tracked = 0,
+	Modified = 1
+}
+interface SyncJson {
+	datajson: { [key: string]: SyncStatus };
+	canvasjson: { [key: string]: SyncStatus };
+}
 
+interface TaskCache {
+	Tasks: { [key: string]: Task[] };
+}
+interface Task extends DataNode {
+	subtasks: DataNode[];
+}
 interface DataNode {
 	id: string;
 	level: number;
@@ -86,9 +101,6 @@ interface SameLevelChain {
 interface SameLevelChainMap {
 	chains: Map<number, SameLevelChain[]>;
 }
-interface O_ChainMap {
-	O_Chains: Map<LinkedListNode, SameLevelChainMap>;
-}
 
 interface SubgraphSize {
 	parentID: string;
@@ -97,6 +109,7 @@ interface SubgraphSize {
 }
 
 const DEFAULT_SETTINGS: NodeGraphSettings = {
+	rootPath: "static/_data/OKR",
 	tsvFolderPath: "tsv",
 	dataJsonFolderPath: "data_json",
 	canvasJsonFolderPath: "canvas_json",
@@ -108,6 +121,13 @@ const STATUS_TO_COLOR: { [key: number]: string } = {
 	1: "5", // 进行中
 	2: "4", // 已完成
 };
+const LEVEL_TO_COLOR: { [key: number]: string } = {
+	1: "rgba(255, 0, 0, 1)", //目标
+	2: "rgba(255, 165, 0, 1)", //关键成果
+	3: "rgba(0, 128, 0, 1)", //任务
+	4: "rgba(0, 0, 255, 1)", //子任务
+};
+
 
 // 字符宽度常量 (每字符像素)
 const BODY_CHINESE_CHAR_WIDTH = 16;
@@ -165,6 +185,7 @@ function countCharacters(text: string): {
 export default class NodeGraphPlugin extends Plugin {
 	settings: NodeGraphSettings;
 	Graph: Graph = new Graph();
+	syncFilePath: string = "";
 	async onload() {
 		await this.loadSettings();
 
@@ -173,20 +194,43 @@ export default class NodeGraphPlugin extends Plugin {
 			"network",
 			"Node Graph",
 			(_evt: MouseEvent) => {
-				this.processFiles(true); // 传递true强制重新生成JSON文件
+				this.processFiles(); // 传递true强制重新生成JSON文件
 			}
 		);
 		ribbonIconEl.addClass("node-graph-ribbon-class");
 
 		// 添加设置选项卡
 		this.addSettingTab(new NodeGraphSettingTab(this.app, this));
-
+		this.syncFilePath = `${this.settings.rootPath}/syncFile.json`
 		// 插件加载时处理文件
 		this.processFiles();
+		this.app.vault.on('modify', this.handleFileModify.bind(this));
+		this.addCommand({
+			id: "processFiles",
+			name: "处理文件",
+			callback: () => {
+				this.processFiles(); // 
+			},
+		});
+		this.addCommand({
+			id: "settle-tasks",
+			name: "结算任务",
+			callback: () => {
+				this.sync_tasks(true); // 最后一次同步任务，将未完成状态改为未安排，遍历出可安排任务，写入cache
+			},
+		});
+		this.addCommand({
+			id: "sync-tasks",
+			name: "同步任务状态",
+			callback: () => {
+				this.sync_tasks(); // 同步cache中的任务状态
+			},
+		});
 	}
 
 	onunload() {
 		// 清理工作
+		this.app.vault.off('modify', this.handleFileModify.bind(this));
 	}
 
 	async loadSettings() {
@@ -197,32 +241,321 @@ export default class NodeGraphPlugin extends Plugin {
 		);
 	}
 
+
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+	
+	async sync_tasks(if_settle: boolean = false)// 同步cache中的任务状态
+	{
+		let newTaskCache: TaskCache = { Tasks: {} };
+		
+		
+		// 读取Task Cache
+		const taskCachePath = `${this.settings.rootPath}/taskCache.json`;
+		if(!await this.fileExists(taskCachePath))
+		{
+			// 如果文件不存在，创建一个空的Task Cache
+			const emptyTaskCache: TaskCache = {
+				Tasks: {}
+			};
+			await this.writeJsonFile(taskCachePath, emptyTaskCache);
+		}
+		const taskCache = await this.readJsonFile<TaskCache>(taskCachePath);
+		// 同步任务状态
+		for(const fileName in taskCache.Tasks)
+		{
+			const dataJsonPath = `${this.settings.rootPath}/${this.settings.dataJsonFolderPath}/${fileName}.json`;
+			const dataJson = await this.readJsonFile<DataJson>(dataJsonPath);
+			let graph = this.Graph.convertDataJsonToLinkedListGraph(dataJson);
+			const taskList = taskCache.Tasks[fileName];
+			taskList.forEach((task) => {
+				const taskNode = graph.nodes.get(task.id);
+				if(task)
+				{
+					let if_done = true;
+					// 递归更新子任务状态
+					task.subtasks.forEach((subtask) => {
+						const subtaskNode = graph.nodes.get(subtask.id);
+						if(subtaskNode)
+						{
+							subtaskNode.data.status = subtask.status;
+							dataJson.nodes.find((node) => node.id === subtask.id).status = subtask.status;
+							
+							if(subtask.status !== 2)
+							{
+								if_done = false;
+							}
+						}
+					});
+					// 如果所有子任务都是已完成，更新当前任务状态
+					if(if_done)
+					{
+						task.status = 2;
+					}
+					taskNode.data.status = task.status;
+					dataJson.nodes.find((node) => node.id === task.id).status = task.status;
+					
+				}
+			});
+			taskList.forEach((task) => {
+				if(task.status === 2)
+				{
+				
+				let first = graph.nodes.get(task.id)
+				let queue = [first];
+				while(queue.length > 0)
+				{
+					const currentTask = queue.shift()!;
+					graph.nodes.get(currentTask.data.id)?.successors.forEach((successor) => {
+						const successorNode = graph.nodes.get(successor);
+						if(successorNode)
+						{
+							
+							if(successorNode.data.level === currentTask.data.level && successorNode.data.status === 2)
+							{
+								queue.push(successorNode);
+							}else if(successorNode.data.level === currentTask.data.level - 1)
+							{
+								if(successorNode.data.status === 2)
+								{
+									return
+								}
+								let isAllPredDone = true;
+								successorNode.predecessors.forEach((pred) => {
+									const predNode = graph.nodes.get(pred);
+									if(predNode)
+									{
+										if(predNode.data.status !== 2)
+										{
+											isAllPredDone = false;
+											return;
+										}
+									}
+								});
+								if(isAllPredDone)
+								{
+									successorNode.data.status = 2;
+									dataJson.nodes.find((node) => node.id === successorNode.data.id).status = 2;
+								}
+							}else{return;}
+							
+						}
+					});
+				}
+			}else if(task.status === 1)
+			{
+				
+				let first = graph.nodes.get(task.id)
+				if(if_settle)
+				{
+					first.data.status = 0;
+					dataJson.nodes.find((node) => node.id === first.data.id).status = 0;
+					let queue: LinkedListNode[] = [];
+					first.predecessors.forEach((pred) => {
+						queue.push(graph.nodes.get(pred));
+					});
+					
+					while(queue.length > 0)
+					{
+						const currentTask = queue.shift()!;
+						graph.nodes.get(currentTask.data.id)?.predecessors.forEach((pred) => {
+							const predNode = graph.nodes.get(pred);
+							if(predNode)
+							{
+								
+								if(predNode.data.status === 2)
+								{
+									return
+								}else if(predNode.data.status === 1)
+								{
+									queue.push(predNode);
+									predNode.data.status = 0;
+									dataJson.nodes.find((node) => node.id === predNode.data.id).status = 0;
+								}
+								
+							}
+						});
+					}
+				}
+				let queue = [first];
+				while(queue.length > 0)
+				{
+					const currentTask = queue.shift()!;
+					graph.nodes.get(currentTask.data.id)?.successors.forEach((successor) => {
+						const successorNode = graph.nodes.get(successor);
+						if(successorNode)
+						{
+							if(successorNode.data.level === currentTask.data.level - 1)
+							{
+								if(if_settle===true)
+								{
+									successorNode.data.status = 0;
+									dataJson.nodes.find((node) => node.id === successorNode.data.id).status = 0;
+								}else{
+									successorNode.data.status = 1;
+									dataJson.nodes.find((node) => node.id === successorNode.data.id).status = 1;
 
+								}
+								
+							}else{queue.push(successorNode);}
+							
+						}
+					});
+				}
+			}
+			
+			})
+
+			// 写入Data JSON
+			await this.writeJsonFile(dataJsonPath, dataJson);
+			this.writeSyncStatus(this.syncFilePath,fileName,SyncStatus.Modified,SyncStatus.Tracked);
+
+			if(if_settle)
+			{
+				const rootNodes: LinkedListNode[] = [];
+		 		graph.nodes.forEach((node, id) => {
+					if (node.data.level === 1) {
+						rootNodes.push(node);
+					}
+				});
+				rootNodes.forEach(async (rootNode) => {
+					let queue: LinkedListNode[] = [];
+					let kr_queue: LinkedListNode[] = [];
+					let task_queue: LinkedListNode[] = [];
+					
+					rootNode.predecessors.forEach((pred) => {
+						const predNode = graph.nodes.get(pred);
+						if(predNode)
+						{
+							if(predNode.data.level === rootNode.data.level + 1 && predNode.data.status === 0)
+							queue.push(predNode);
+						}
+					});
+					while(queue.length > 0)
+					{
+						const krNode = queue.shift()!;
+						let if_end = true;
+						graph.nodes.get(krNode.data.id)?.predecessors.forEach((pred) => {
+							
+							const predNode = graph.nodes.get(pred);
+							if(predNode)
+							{
+								if(predNode.data.level === krNode.data.level && predNode.data.status === 0)
+								{
+									queue.push(predNode);
+									if_end = false
+								}else if(predNode.data.level === krNode.data.level && predNode.data.status === 2)
+								{
+									kr_queue.push(krNode);
+									if_end = false
+								}
+								
+							}
+						});
+						if(if_end)
+						{
+							kr_queue.push(krNode);
+						}
+					}
+					kr_queue.forEach((krNode) => {
+						krNode.predecessors.forEach((pred) => {
+							const predNode = graph.nodes.get(pred);
+							if(predNode)
+							{
+								if(predNode.data.level === rootNode.data.level + 1 && predNode.data.status === 0)
+								queue.push(predNode);
+							}
+						});
+					});
+					while(queue.length > 0)
+					{
+						const Task_Node = queue.shift()!;
+						let if_end = true;
+						graph.nodes.get(Task_Node.data.id)?.predecessors.forEach((pred) => {
+							const predNode = graph.nodes.get(pred);
+							if(predNode)
+							{
+								if(predNode.data.level === Task_Node.data.level && predNode.data.status === 0)
+								{
+									queue.push(predNode);
+									if_end = false
+								}else if(predNode.data.level === Task_Node.data.level && predNode.data.status === 2)	
+								{
+									task_queue.push(Task_Node);
+									if_end = false
+								}
+								
+							}
+						});
+						if(if_end)
+						{
+							task_queue.push(Task_Node);
+						}
+					}
+					let task_list:Task[] = [];
+					task_queue.forEach((Task_Node) => {
+						let queue: LinkedListNode[] = [graph.nodes.get(Task_Node.predecessors[0])!];
+						let subtask_list:DataNode[] = [];
+						while(queue.length > 0)
+						{
+							const currentTask = queue.shift()!;
+							graph.nodes.get(currentTask.data.id)?.predecessors.forEach((pred) => {
+								const predNode = graph.nodes.get(pred);
+								if(predNode)
+								{
+									if(predNode.data.status === 0)
+								{
+									queue.push(predNode);
+								}
+
+								}
+							});
+							subtask_list.push(currentTask.data);
+
+						}
+						let task:Task = {
+							id: Task_Node.data.id,
+							level: Task_Node.data.level,
+							content: Task_Node.data.content,
+							estimated_time: Task_Node.data.estimated_time,
+							status: Task_Node.data.status,
+							subtasks: subtask_list,
+						}
+						task_list.push(task);
+					});
+					newTaskCache.Tasks[fileName].push(...task_list);
+					await this.writeJsonFile(taskCachePath, newTaskCache);
+				});
+
+			}
+		}
+	}
+	
 	// 主处理函数
-	async processFiles(forceRegenerate = false) {
+	async processFiles() {
+		const vault = this.app.vault;
+
+		// 确保文件夹存在
+		await this.ensureFoldersExist();
+
 		try {
-			const vault = this.app.vault;
-
-			// 确保文件夹存在
-			await this.ensureFoldersExist();
-
+			
 			// 获取所有TSV文件
 			const tsvFiles = await this.getFilesInFolder(
-				this.settings.tsvFolderPath,
+				`${this.settings.rootPath}/${this.settings.tsvFolderPath}`,
 				".tsv"
 			);
+			
 
 			for (const tsvFile of tsvFiles) {
 				const fileName = path.basename(tsvFile, ".tsv");
-				const dataJsonPath = `${this.settings.dataJsonFolderPath}/${fileName}.json`;
-				const canvasJsonPath = `${this.settings.canvasJsonFolderPath}/${fileName}.canvas`;
+				const dataJsonPath = `${this.settings.rootPath}/${this.settings.dataJsonFolderPath}/${fileName}.json`;
+				const canvasJsonPath = `${this.settings.rootPath}/${this.settings.canvasJsonFolderPath}/${fileName}.canvas`;
 
 				// 检查是否需要从TSV转换（文件不存在或强制重新生成）
 				const dataJsonExists = await this.fileExists(dataJsonPath);
-				if (!dataJsonExists || forceRegenerate) {
+				if (!dataJsonExists) {
 					// 从TSV转换到Data JSON
 					const tsvContent = await this.readFile(tsvFile);
 					const dataJson =
@@ -244,22 +577,190 @@ export default class NodeGraphPlugin extends Plugin {
 						this.Graph.convertDataJsonToCanvasJson(dataJson);
 					await this.writeJsonFile(canvasJsonPath, canvasJson);
 					new Notice(`已将 ${fileName}.json 转换为 Canvas JSON`);
-				} else {
-					// 同步Data JSON和Canvas JSON
-					await this.syncJsonFiles(dataJsonPath, canvasJsonPath);
+					await this.writeSyncStatus(
+						this.syncFilePath,
+						fileName,
+						SyncStatus.Tracked,
+						SyncStatus.Tracked,
+					);
 				}
 			}
 
-			new Notice("Node Graph 处理完成");
+			new Notice("TSV文件处理完成");
+
 		} catch (error) {
-			console.error("处理文件时出错:", error);
+			console.error("处理TSV文件时出错:", error);
 			// 确保显示详细的错误信息，包括行号和具体问题
 			const errorMessage =
 				error instanceof Error ? error.message : "未知错误";
-			new Notice(`Node Graph 处理失败: ${errorMessage}`);
+			new Notice(`TSV文件处理失败: ${errorMessage}`);
+		}
+		try{
+			if(!await this.fileExists(this.syncFilePath))
+				return;
+			let syncJson = await this.readJsonFile<SyncJson>(
+						this.syncFilePath
+			);
+			// 使用Object.entries遍历对象字面量
+			for (const [fileName, status] of Object.entries(syncJson.datajson)) {
+				if (status === SyncStatus.Modified) {
+					const dataJsonPath = `${this.settings.rootPath}/${this.settings.dataJsonFolderPath}/${fileName}.json`;
+					const canvasJsonPath = `${this.settings.rootPath}/${this.settings.canvasJsonFolderPath}/${fileName}.canvas`;
+					let dataJson = await this.readJsonFile<DataJson>(dataJsonPath);
+					let canvasJson = await this.readJsonFile<CanvasJson>(canvasJsonPath);
+					dataJson.nodes.forEach((node) => {
+						const canvasNode = canvasJson.nodes.find(
+							(n) => n.id === node.id
+						);
+						if (canvasNode) {
+							if(node.status!==0)
+								canvasNode.color = STATUS_TO_COLOR[node.status];
+							else
+								canvasNode.color = LEVEL_TO_COLOR[node.level];
+						}
+					});
+					await this.writeJsonFile(canvasJsonPath, canvasJson);
+				}
+				await this.writeSyncStatus(
+						this.syncFilePath,
+					fileName,
+					SyncStatus.Tracked,
+					SyncStatus.Tracked,
+				);
+			}
+			// 使用Object.entries遍历canvasjson对象字面量
+			for (const [fileName, status] of Object.entries(syncJson.canvasjson)) {
+				if (status === SyncStatus.Modified) {
+					const dataJsonPath = `${this.settings.rootPath}/${this.settings.dataJsonFolderPath}/${fileName}.json`;
+					const canvasJsonPath = `${this.settings.rootPath}/${this.settings.canvasJsonFolderPath}/${fileName}.canvas`;
+					let dataJson = await this.readJsonFile<DataJson>(dataJsonPath);
+					let canvasJson = await this.readJsonFile<CanvasJson>(canvasJsonPath);
+					canvasJson.nodes.forEach((node) => {
+						const dataNode = dataJson.nodes.find(
+							(n) => n.id === node.id
+						);
+						if (dataNode) {
+							let color = node.color;
+							for(let status in STATUS_TO_COLOR){
+								if(STATUS_TO_COLOR[status]===color){
+									dataNode.status = parseInt(status);
+									break;
+								}
+							}
+							
+							
+							for(let level in LEVEL_TO_COLOR){
+								if(LEVEL_TO_COLOR[level]===node.color){
+									dataNode.level = parseInt(level);
+									break;
+								}
+							}
+							dataNode.content = node.text;
+						}else{
+							let color = node.color;
+							let Nodestatus = 0;
+							let Nodelevel = 0;
+							for(let status in STATUS_TO_COLOR){
+								if(STATUS_TO_COLOR[status]===color){
+									Nodestatus = parseInt(status);
+									break;
+								}
+							}
+							for(let level in LEVEL_TO_COLOR){
+								if(LEVEL_TO_COLOR[level]===node.color){
+									Nodelevel = parseInt(level);
+									break;
+								}
+							}
+							
+							let dataNode :DataNode = {
+								id: node.id,
+								level: Nodelevel,
+								content: node.text,
+								estimated_time: '',
+								status: Nodestatus
+							};
+							dataJson.nodes.push(dataNode);
+						}
+					});
+					canvasJson.edges.forEach((edge) => {
+						const dataEdge = dataJson.edges.find(
+							(e) => e.from === edge.fromNode && e.to === edge.toNode
+						);
+						if (!dataEdge) {
+							dataJson.edges.push({
+								
+								from: edge.fromNode,
+								to: edge.toNode,
+								
+							});
+						}
+					});
+					await this.writeJsonFile(dataJsonPath, dataJson);
+				}
+				await this.writeSyncStatus(
+						this.syncFilePath,
+					fileName,
+					SyncStatus.Tracked,
+					SyncStatus.Tracked,
+				);
+			};
+
+
+		}catch (error) {
+			console.error("同步文件时出错:", error);
+			// 确保显示详细的错误信息，包括行号和具体问题
+			const errorMessage =
+				error instanceof Error ? error.message : "未知错误";
+			new Notice(`同步文件失败: ${errorMessage}`);
 		}
 	}
+	async writeSyncStatus(
+		syncFilePath: string,
+		fileName: string,
+		datajsonStatus: SyncStatus,
+		canvasjsonStatus: SyncStatus,
+	) {
+		const syncFileExists = await this.fileExists(syncFilePath);
+		let syncJson: SyncJson;
+		if (!syncFileExists) {
+			syncJson = {
+				datajson: {},
+				canvasjson: {},
+			};
 
+		}else{
+			syncJson = await this.readJsonFile<SyncJson>(
+				syncFilePath
+			);}
+		new Notice(`文件 ${fileName} 已writeSyncStatus`);
+		// 使用对象字面量而不是Map
+		syncJson.datajson[fileName] = datajsonStatus;
+		syncJson.canvasjson[fileName] = canvasjsonStatus;
+		await this.writeJsonFile(syncFilePath, syncJson);
+	}
+
+	async handleFileModify(file: TFile) {
+		// new Notice(`文件 ${file.path} 已修改`);
+		new Notice(`${this.settings.rootPath}/${this.settings.dataJsonFolderPath}`);
+		if(file.path.startsWith(`${this.settings.rootPath}/${this.settings.dataJsonFolderPath}`)){
+			let fileName = file.basename.split(".")[0];
+			await this.writeSyncStatus(
+					this.syncFilePath,
+				fileName,
+				SyncStatus.Modified,
+				SyncStatus.Tracked,
+			);
+		}else if(file.path.startsWith(`${this.settings.rootPath}/${this.settings.canvasJsonFolderPath}`)){
+			let fileName = file.basename.split(".")[0];
+			await this.writeSyncStatus(
+					this.syncFilePath,
+				fileName,
+				SyncStatus.Tracked,
+				SyncStatus.Modified,
+			);
+		}
+	}
 	// 确保文件夹存在
 	async ensureFoldersExist() {
 		const vault = this.app.vault;
@@ -355,99 +856,6 @@ export default class NodeGraphPlugin extends Plugin {
 			await vault.create(normalizedPath, content);
 		}
 	}
-
-	// 同步Data JSON和Canvas JSON
-	async syncJsonFiles(dataJsonPath: string, canvasJsonPath: string) {
-		// 读取两个JSON文件
-		const dataJson = await this.readJsonFile<DataJson>(dataJsonPath);
-		const canvasJson = await this.readJsonFile<CanvasJson>(canvasJsonPath);
-
-		// 创建节点映射
-		const dataNodeMap = new Map<string, DataNode>();
-		dataJson.nodes.forEach((node) => dataNodeMap.set(node.id, node));
-
-		const canvasNodeMap = new Map<string, CanvasNode>();
-		canvasJson.nodes.forEach((node) => canvasNodeMap.set(node.id, node));
-
-		// 检查是否需要更新Canvas JSON
-		let needsUpdate = false;
-
-		// 更新节点
-		canvasJson.nodes.forEach((canvasNode) => {
-			const dataNode = dataNodeMap.get(canvasNode.id);
-			if (dataNode) {
-				// 更新文本内容
-				if (canvasNode.text !== dataNode.content) {
-					canvasNode.text = dataNode.content;
-					needsUpdate = true;
-				}
-
-				// 更新颜色（基于状态）
-				const newColor = STATUS_TO_COLOR[dataNode.status] || "0";
-				if (canvasNode.color !== newColor) {
-					canvasNode.color = newColor;
-					needsUpdate = true;
-				}
-			}
-		});
-
-		// 检查是否有新节点需要添加
-		dataJson.nodes.forEach((dataNode) => {
-			if (!canvasNodeMap.has(dataNode.id)) {
-				// 添加新节点
-				const newCanvasNode: CanvasNode = {
-					id: dataNode.id,
-					type: "text",
-					text: dataNode.content,
-					styleAttributes:
-						dataNode.level === 0 || dataNode.level === 1
-							? { textAlign: "center" }
-							: {},
-					x: -1500, // 默认位置，可以后续优化
-					y: 220,
-					width: Math.max(
-						120,
-						Math.min(dataNode.content.length * 8, 400)
-					),
-					height: 60,
-					color: STATUS_TO_COLOR[dataNode.status] || "0",
-				};
-				canvasJson.nodes.push(newCanvasNode);
-				needsUpdate = true;
-			}
-		});
-
-		// 检查是否有新边需要添加
-		const existingEdgeIds = new Set(
-			canvasJson.edges.map((edge) => `${edge.fromNode}_${edge.toNode}`)
-		);
-		dataJson.edges.forEach((edge) => {
-			// 验证边的有效性：to节点必须存在于数据节点映射中
-			if (dataNodeMap.has(edge.to)) {
-				const edgeId = `${edge.from}_${edge.to}`;
-				if (!existingEdgeIds.has(edgeId)) {
-					// 添加新边
-					canvasJson.edges.push({
-						id: edgeId,
-						styleAttributes: {},
-						toFloating: false,
-						fromFloating: false,
-						fromNode: edge.from,
-						fromSide: "right",
-						toNode: edge.to,
-						toSide: "left",
-					});
-					needsUpdate = true;
-				}
-			}
-		});
-
-		// 如果需要更新，写入Canvas JSON
-		if (needsUpdate) {
-			await this.writeJsonFile(canvasJsonPath, canvasJson);
-			new Notice(`已同步 ${path.basename(canvasJsonPath)}`);
-		}
-	}
 }
 
 class NodeGraphSettingTab extends PluginSettingTab {
@@ -464,6 +872,18 @@ class NodeGraphSettingTab extends PluginSettingTab {
 		containerEl.empty();
 		containerEl.createEl("h2", { text: "Node Graph 设置" });
 
+		new Setting(containerEl)
+			.setName("根文件夹路径")
+			.setDesc("存放数据的文件夹路径")
+			.addText((text) =>
+				text
+					.setPlaceholder("static/_data/OKR")
+					.setValue(this.plugin.settings.rootPath)
+					.onChange(async (value) => {
+						this.plugin.settings.rootPath = value;
+						await this.plugin.saveSettings();
+					})
+			);
 		// TSV文件夹路径设置
 		new Setting(containerEl)
 			.setName("TSV文件夹路径")
@@ -512,9 +932,7 @@ class Graph {
 	graph: LinkedListGraph = {
 		nodes: new Map(),
 	};
-	O_ChainMap: O_ChainMap = {
-		O_Chains: new Map(),
-	};
+	
 	sameLevelChainMap: SameLevelChainMap = {
 		chains: new Map(),
 	};
@@ -621,7 +1039,6 @@ class Graph {
 		// 预计算并缓存所有节点的宽高，便于后续布局与渲染使用
 		this.calculateAllNodeSizes();
 
-		
 		//遍历rootNodes，将它们添加到canvasNodes中
 		const rootNodes: LinkedListNode[] = [];
 		this.graph.nodes.forEach((node, id) => {
@@ -629,11 +1046,11 @@ class Graph {
 				rootNodes.push(node);
 				this.getSameLevelMap(node).forEach((chains, level) => {
 					this.sameLevelChainMap.chains.set(level, chains);
-				});	
+				});
 			}
 		});
-		canvasNodes = canvasNodes.concat(this.canvasAddNodeFromRoot(canvasNodes,rootNodes));
-		canvasEdges = canvasEdges.concat(this.canvasAddEdgeFromRoot(canvasEdges,rootNodes));
+		canvasNodes = canvasNodes.concat(this.canvasAddNodeFromRoot(canvasNodes, rootNodes));
+		canvasEdges = canvasEdges.concat(this.canvasAddEdgeFromRoot(canvasEdges, rootNodes));
 		return {
 			nodes: canvasNodes,
 			edges: canvasEdges,
@@ -644,47 +1061,47 @@ class Graph {
 		};
 	}
 
-	canvasAddEdgeFromRoot(canvasEdges: CanvasEdge[],rootNodes: LinkedListNode[]): CanvasEdge[] {
+	canvasAddEdgeFromRoot(canvasEdges: CanvasEdge[], rootNodes: LinkedListNode[]): CanvasEdge[] {
 		//创建边
 		for (let i = 0; i < rootNodes.length; i++) {
-			 rootNodes[i].predecessors.forEach((predecessor) => {
+			rootNodes[i].predecessors.forEach((predecessor) => {
 				let predecessornode =
 					this.graph.nodes.get(predecessor);
 				if (predecessornode?.data.level === rootNodes[i].data.level + 1)
-				canvasEdges.push({
-					id: `${predecessor}_${rootNodes[i].data.id}`,
-					styleAttributes: {},
-					toFloating: false,
-					fromFloating: false,
-					fromNode: predecessornode?.data.id,
-					fromSide: "right",
-					toNode: rootNodes[i].data.id,
-					toSide: "left",
-				});
-			 });
+					canvasEdges.push({
+						id: `${predecessor}_${rootNodes[i].data.id}`,
+						styleAttributes: {},
+						toFloating: false,
+						fromFloating: false,
+						fromNode: predecessornode?.data.id,
+						fromSide: "right",
+						toNode: rootNodes[i].data.id,
+						toSide: "left",
+					});
+			});
 		}
-			let map = this.sameLevelChainMap;
-			let directionMap = new Map([
-				[1, ["right", "left"]],
-				[2, ["right", "left"]],
-				[3, ["top", "bottom"]],
-			]);
-			for (const [level, chains] of map.chains) {
-				if (level === 4) {
-					continue;
-				} else {
-					chains.forEach((chain) => {
-						for (let i = 0; i < chain.chain.length; i++) {
-							if(i !== chain.chain.length - 1)
-							canvasEdges.push({	
-							id: `${chain.chain[i+1].data.id}_${chain.chain[i].data.id}`,
-							styleAttributes: {},
-							toFloating: false,
-							fromFloating: false,
-							fromNode: chain.chain[i+1].data.id,
-							fromSide: directionMap.get(level)?.[0] ?? "right",
-							toNode: chain.chain[i].data.id,
-							toSide: directionMap.get(level)?.[1] ?? "left",
+		let map = this.sameLevelChainMap;
+		let directionMap = new Map([
+			[1, ["right", "left"]],
+			[2, ["right", "left"]],
+			[3, ["top", "bottom"]],
+		]);
+		for (const [level, chains] of map.chains) {
+			if (level === 4) {
+				continue;
+			} else {
+				chains.forEach((chain) => {
+					for (let i = 0; i < chain.chain.length; i++) {
+						if (i !== chain.chain.length - 1)
+							canvasEdges.push({
+								id: `${chain.chain[i + 1].data.id}_${chain.chain[i].data.id}`,
+								styleAttributes: {},
+								toFloating: false,
+								fromFloating: false,
+								fromNode: chain.chain[i + 1].data.id,
+								fromSide: directionMap.get(level)?.[0] ?? "right",
+								toNode: chain.chain[i].data.id,
+								toSide: directionMap.get(level)?.[1] ?? "left",
 							});
 						chain.chain[i].predecessors.forEach((predecessor) => {
 							let predecessornode =
@@ -702,7 +1119,7 @@ class Graph {
 											toNode: chain.chain[i].data.id,
 											toSide: "left",
 										});
-									} else{
+									} else {
 										canvasEdges.push({
 											id: `${predecessor}_${chain.chain[i].data.id}`,
 											styleAttributes: {},
@@ -714,7 +1131,6 @@ class Graph {
 											toSide: "right",
 										});
 									}
-										
 								} else
 									canvasEdges.push({
 										id: `${predecessor}_${chain.chain[i].data.id}`,
@@ -740,9 +1156,9 @@ class Graph {
 	canvasAddNodeFromRoot(
 		canvasNodes: CanvasNode[],
 		rootNodes: LinkedListNode[]
-	
+
 	): CanvasNode[] {
-		
+
 		let O_X = START_X;
 		let O_Y = START_Y;
 		for (let i = 0; i < rootNodes.length; i++) {
@@ -769,10 +1185,10 @@ class Graph {
 					this.graph.nodes.get(rootNodes[i].data.id)?.size[0] ??
 					this.calculateNodeWidth(rootNodes[i].data),
 				height: NODE_HEIGHT,
-				color: "0",
+				color: rootNodes[i].data.status===0?LEVEL_TO_COLOR[rootNodes[i].data.level]:STATUS_TO_COLOR[rootNodes[i].data.status],
 			});
-			
-			
+
+
 			//遍历KR
 			let KR_X = O_X;
 			let KR_Y = O_Y;
@@ -787,11 +1203,11 @@ class Graph {
 							let Subgraph = this.calculateSubGraphSize(
 								samelevelchain[j]
 							)[0] as number[];
-							if(j === 0){
+							if (j === 0) {
 								KR_X -= samelevelchain[j].size[0] / 2;
 							}
 							KR_X -= KRSubgraphs_Gap + Subgraph[1];
-							
+
 							if (j > 0) {
 								let preSubgraph =
 									this.calculateSubGraphSize(
@@ -824,9 +1240,9 @@ class Graph {
 										samelevelchain[j].data
 									),
 								height: NODE_HEIGHT,
-								color: "0",
+								color: samelevelchain[j].data.status===0?LEVEL_TO_COLOR[samelevelchain[j].data.level]:STATUS_TO_COLOR[samelevelchain[j].data.status],
 							});
-							
+
 							let task_gap: number[] = [taskDefault_gap];
 							let middle =
 								KR_X +
@@ -874,7 +1290,7 @@ class Graph {
 												)[1] +
 												TaskSubgraphs_Gap -
 												task_gap[k];
-											if(tempgap<taskDefault_gap){
+											if (tempgap < taskDefault_gap) {
 												tempgap = taskDefault_gap;
 											}
 											task_gap.push(
@@ -883,7 +1299,7 @@ class Graph {
 											if (k === 0)
 												Task_Y = KR_Y + Subgraph_KR_Gap;
 											else if (k > 0) {
-												Task_Y += task_gap[k - 1];	
+												Task_Y += task_gap[k - 1];
 											}
 											canvasNodes.push({
 												id: samelevelchain[k].data.id,
@@ -912,13 +1328,13 @@ class Graph {
 												width: task_width,
 
 												height: NODE_HEIGHT,
-												color: "0",
+												color: samelevelchain[k].data.status===0?LEVEL_TO_COLOR[samelevelchain[k].data.level]:STATUS_TO_COLOR[samelevelchain[k].data.status],		
 											});
 											let subtask_size = this.calculateSubGraphSize(
 												samelevelchain[k]
 											);
 											let SubTask_X = 0;
-											let SubTask_Y = Task_Y+subtask_size[1]-NODE_HEIGHT;
+											let SubTask_Y = Task_Y + subtask_size[1] - NODE_HEIGHT;
 											let subtask_width =
 												subtask_size[0] as number;
 											//遍历SubTask
@@ -937,9 +1353,9 @@ class Graph {
 												) {
 													let samelevelchain =
 														this.sameLevelChainMap.chains.get(
-																tempNode.data
-																	.level
-															)
+															tempNode.data
+																.level
+														)
 															?.find(
 																(chain) =>
 																	chain.lastnode ===
@@ -1003,7 +1419,6 @@ class Graph {
 																			.content,
 																styleAttributes:
 																{
-																	
 																},
 																x: SubTask_X,
 																y: SubTask_Y,
@@ -1022,7 +1437,7 @@ class Graph {
 																		].data
 																	),
 																height: NODE_HEIGHT,
-																color: "0",
+																color: samelevelchain[l].data.status===0?LEVEL_TO_COLOR[samelevelchain[l].data.level]:STATUS_TO_COLOR[samelevelchain[l].data.status],	
 															});
 														}
 												}
@@ -1196,7 +1611,6 @@ class Graph {
 									nodelist[i].size[0] / 2
 								);
 							}
-							
 						}
 					}
 				}
