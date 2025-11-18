@@ -117,15 +117,14 @@ const DEFAULT_SETTINGS: NodeGraphSettings = {
 
 // 从状态映射到颜色
 const STATUS_TO_COLOR: { [key: number]: string } = {
-	0: "0", // 未安排
 	1: "5", // 进行中
-	2: "4", // 已完成
+	2: "6", // 已完成
 };
 const LEVEL_TO_COLOR: { [key: number]: string } = {
-	1: "rgba(255, 0, 0, 1)", //目标
-	2: "rgba(255, 165, 0, 1)", //关键成果
-	3: "rgba(0, 128, 0, 1)", //任务
-	4: "rgba(0, 0, 255, 1)", //子任务
+	1: "1", //目标
+	2: "2", //关键成果
+	3: "3", //任务
+	4: "4", //子任务
 };
 
 
@@ -216,6 +215,7 @@ export default class NodeGraphPlugin extends Plugin {
 			id: "settle-tasks",
 			name: "结算任务",
 			callback: () => {
+				
 				this.sync_tasks(true); // 最后一次同步任务，将未完成状态改为未安排，遍历出可安排任务，写入cache
 			},
 		});
@@ -248,6 +248,7 @@ export default class NodeGraphPlugin extends Plugin {
 	
 	async sync_tasks(if_settle: boolean = false)// 同步cache中的任务状态
 	{
+		
 		let newTaskCache: TaskCache = { Tasks: {} };
 		
 		
@@ -262,16 +263,24 @@ export default class NodeGraphPlugin extends Plugin {
 			await this.writeJsonFile(taskCachePath, emptyTaskCache);
 		}
 		const taskCache = await this.readJsonFile<TaskCache>(taskCachePath);
+		const tsvFiles = await this.getFilesInFolder(
+				`${this.settings.rootPath}/${this.settings.tsvFolderPath}`,
+				".tsv"
+			);
 		// 同步任务状态
-		for(const fileName in taskCache.Tasks)
-		{
+		for (const tsvFile of tsvFiles) {
+			const fileName = path.basename(tsvFile, ".tsv");
 			const dataJsonPath = `${this.settings.rootPath}/${this.settings.dataJsonFolderPath}/${fileName}.json`;
 			const dataJson = await this.readJsonFile<DataJson>(dataJsonPath);
 			let graph = this.Graph.convertDataJsonToLinkedListGraph(dataJson);
 			const taskList = taskCache.Tasks[fileName];
-			taskList.forEach((task) => {
+			if(taskList)
+			{
+				
+
+				taskList.forEach((task) => {
 				const taskNode = graph.nodes.get(task.id);
-				if(task)
+				if(taskNode)
 				{
 					let if_done = true;
 					// 递归更新子任务状态
@@ -298,7 +307,7 @@ export default class NodeGraphPlugin extends Plugin {
 					
 				}
 			});
-			taskList.forEach((task) => {
+				taskList.forEach((task) => {
 				if(task.status === 2)
 				{
 				
@@ -364,15 +373,12 @@ export default class NodeGraphPlugin extends Plugin {
 							if(predNode)
 							{
 								
-								if(predNode.data.status === 2)
-								{
-									return
-								}else if(predNode.data.status === 1)
+								if(predNode.data.status === 1)
 								{
 									queue.push(predNode);
-									predNode.data.status = 0;
-									dataJson.nodes.find((node) => node.id === predNode.data.id).status = 0;
 								}
+								currentTask.data.status = 0;
+								dataJson.nodes.find((node) => node.id === currentTask.data.id).status = 0;
 								
 							}
 						});
@@ -406,19 +412,24 @@ export default class NodeGraphPlugin extends Plugin {
 			}
 			
 			})
-
-			// 写入Data JSON
-			await this.writeJsonFile(dataJsonPath, dataJson);
-			this.writeSyncStatus(this.syncFilePath,fileName,SyncStatus.Modified,SyncStatus.Tracked);
-
+				// 写入Data JSON
+				await this.writeJsonFile(dataJsonPath, dataJson);
+				this.writeSyncStatus(this.syncFilePath,fileName,SyncStatus.Modified,SyncStatus.Tracked);
+			}
+			
+			
+			
 			if(if_settle)
 			{
+				
+				
 				const rootNodes: LinkedListNode[] = [];
 		 		graph.nodes.forEach((node, id) => {
 					if (node.data.level === 1) {
 						rootNodes.push(node);
 					}
 				});
+				
 				rootNodes.forEach(async (rootNode) => {
 					let queue: LinkedListNode[] = [];
 					let kr_queue: LinkedListNode[] = [];
@@ -434,11 +445,13 @@ export default class NodeGraphPlugin extends Plugin {
 					});
 					while(queue.length > 0)
 					{
+						
 						const krNode = queue.shift()!;
 						let if_end = true;
 						graph.nodes.get(krNode.data.id)?.predecessors.forEach((pred) => {
 							
 							const predNode = graph.nodes.get(pred);
+							
 							if(predNode)
 							{
 								if(predNode.data.level === krNode.data.level && predNode.data.status === 0)
@@ -457,19 +470,24 @@ export default class NodeGraphPlugin extends Plugin {
 						{
 							kr_queue.push(krNode);
 						}
+						
 					}
+					
 					kr_queue.forEach((krNode) => {
 						krNode.predecessors.forEach((pred) => {
 							const predNode = graph.nodes.get(pred);
 							if(predNode)
 							{
-								if(predNode.data.level === rootNode.data.level + 1 && predNode.data.status === 0)
+								if(predNode.data.level === krNode.data.level + 1 && predNode.data.status === 0)
 								queue.push(predNode);
+								
 							}
 						});
 					});
+
 					while(queue.length > 0)
 					{
+						
 						const Task_Node = queue.shift()!;
 						let if_end = true;
 						graph.nodes.get(Task_Node.data.id)?.predecessors.forEach((pred) => {
@@ -492,21 +510,24 @@ export default class NodeGraphPlugin extends Plugin {
 						{
 							task_queue.push(Task_Node);
 						}
+						// console.log(queue);
 					}
+					// console.log(task_queue);
+					
 					let task_list:Task[] = [];
 					task_queue.forEach((Task_Node) => {
-						let queue: LinkedListNode[] = [graph.nodes.get(Task_Node.predecessors[0])!];
+						let subtask_queue: LinkedListNode[] = [graph.nodes.get(Task_Node.predecessors[0])!];
 						let subtask_list:DataNode[] = [];
-						while(queue.length > 0)
+						while(subtask_queue.length > 0)
 						{
-							const currentTask = queue.shift()!;
+							const currentTask = subtask_queue.shift()!;
 							graph.nodes.get(currentTask.data.id)?.predecessors.forEach((pred) => {
 								const predNode = graph.nodes.get(pred);
 								if(predNode)
 								{
 									if(predNode.data.status === 0)
 								{
-									queue.push(predNode);
+									subtask_queue.push(predNode);
 								}
 
 								}
@@ -524,12 +545,17 @@ export default class NodeGraphPlugin extends Plugin {
 						}
 						task_list.push(task);
 					});
+					// 确保newTaskCache.Tasks[fileName]已初始化
+					if (!newTaskCache.Tasks[fileName]) {
+						newTaskCache.Tasks[fileName] = [];
+					}
 					newTaskCache.Tasks[fileName].push(...task_list);
 					await this.writeJsonFile(taskCachePath, newTaskCache);
 				});
 
 			}
 		}
+		await this.processFiles();
 	}
 	
 	// 主处理函数
@@ -620,13 +646,14 @@ export default class NodeGraphPlugin extends Plugin {
 						}
 					});
 					await this.writeJsonFile(canvasJsonPath, canvasJson);
-				}
-				await this.writeSyncStatus(
+					await this.writeSyncStatus(
 						this.syncFilePath,
-					fileName,
-					SyncStatus.Tracked,
-					SyncStatus.Tracked,
-				);
+						fileName,
+						SyncStatus.Tracked,
+						SyncStatus.Tracked,
+					);
+				}
+				
 			}
 			// 使用Object.entries遍历canvasjson对象字面量
 			for (const [fileName, status] of Object.entries(syncJson.canvasjson)) {
@@ -652,6 +679,7 @@ export default class NodeGraphPlugin extends Plugin {
 							for(let level in LEVEL_TO_COLOR){
 								if(LEVEL_TO_COLOR[level]===node.color){
 									dataNode.level = parseInt(level);
+									dataNode.status = 0;
 									break;
 								}
 							}
@@ -697,13 +725,14 @@ export default class NodeGraphPlugin extends Plugin {
 						}
 					});
 					await this.writeJsonFile(dataJsonPath, dataJson);
-				}
-				await this.writeSyncStatus(
+					await this.writeSyncStatus(
 						this.syncFilePath,
-					fileName,
-					SyncStatus.Tracked,
-					SyncStatus.Tracked,
-				);
+						fileName,
+						SyncStatus.Tracked,
+						SyncStatus.Tracked,
+					);
+				}
+				
 			};
 
 
@@ -733,7 +762,7 @@ export default class NodeGraphPlugin extends Plugin {
 			syncJson = await this.readJsonFile<SyncJson>(
 				syncFilePath
 			);}
-		new Notice(`文件 ${fileName} 已writeSyncStatus`);
+		
 		// 使用对象字面量而不是Map
 		syncJson.datajson[fileName] = datajsonStatus;
 		syncJson.canvasjson[fileName] = canvasjsonStatus;
@@ -741,8 +770,6 @@ export default class NodeGraphPlugin extends Plugin {
 	}
 
 	async handleFileModify(file: TFile) {
-		// new Notice(`文件 ${file.path} 已修改`);
-		new Notice(`${this.settings.rootPath}/${this.settings.dataJsonFolderPath}`);
 		if(file.path.startsWith(`${this.settings.rootPath}/${this.settings.dataJsonFolderPath}`)){
 			let fileName = file.basename.split(".")[0];
 			await this.writeSyncStatus(
